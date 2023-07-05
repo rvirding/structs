@@ -27,15 +27,31 @@
 
 -export([parse_transform/2, parse_transform_info/0]).
 
--define(StrRec, '__elixir_struct__').
--define(StrFunc, '__struct__').
+%% Pseudo record used by struct macros. It is never really defined but
+%% the struct include file "know" how we use it.
+
+%% -record('__elixir_struct__', {module,fields}).
+
+-define(StrRec, '__elixir_struct__').           %Pseudo record
+-define(StrFunc, '__struct__').	                %Compliant struct function name
+
+%% Struct data saved. In this quick hack we store it in the process
+%% dictionary
+
+-record(struct_data, {mod,
+		      anno,			%Struct anno
+		      def_struct,		%The default struct map
+		      def_fields,		%Fields from default struct
+		      map_fields		%Fields as for map
+		     }).
 
 parse_transform(Forms, _Options) ->
-    put(struct_fields, none),			%This indicates a struct
     Fs = forms(Forms),
+    %% Make sure we get all the attributes first and the struct
+    %% functions.
     Attrs = collect_attributes(Fs),
     Others = collect_others(Fs),
-    %% io:format("Get ~p\n", [get()]),
+    io:format("Get ~p\n", [get()]),
     Attrs ++ struct_attributes() ++ struct_inits() ++ Others.
 
 parse_transform_info() ->
@@ -70,23 +86,26 @@ forms([]) -> [].
 %%  that the ordering is correct!
 
 %% First the various attributes.
-form({attribute,Anno,defstruct,StructDef} = DefStruct) ->
+form({attribute,Anno,defstruct,DefFields} = DefStruct) ->
     Fun = fun ({Key,Val}) -> {map_field_assoc,Anno,
-			      erl_parse:abstract(Key, Anno),
-			      erl_parse:abstract(Val, Anno)} end,
+                              erl_parse:abstract(Key, Anno),
+                              erl_parse:abstract(Val, Anno)} end,
     %% StructFields = lists:map(Fun, maps:to_list(StructDef)),
-    %% io:format("def ~p\n    ~p\n",
-    %%           [StructDef,erl_parse:abstract(StructDef,Anno)]),
-    StructFields = lists:map(Fun, StructDef),
+    io:format("def ~p\n    ~p\n",
+              [DefFields,erl_parse:abstract(Anno,DefFields)]),
+    MapFields = lists:map(Fun, DefFields),
     %% Save the struct info.
-    put(struct_fields, StructFields),
-    put(struct_anno, Anno),
-    DefStruct;					%Save it in the module
+    StructData = #struct_data{anno = Anno,
+			      def_fields = DefFields,
+			      map_fields = MapFields
+			     },
+    put(struct_data, StructData),		%We have a struct!
+    DefStruct;                                  %Save it in the module
 
 form({attribute,Anno,module,Mod}) ->
-    put(module_name, Mod),
+    put(module_name, Mod),			%Save the current module name
     {attribute,Anno,module,Mod};
-form({attribute,Anno,file,{File,Line}}) ->	%This is valid anywhere.
+form({attribute,Anno,file,{File,Line}}) ->      %This is valid anywhere.
     {attribute,Anno,file,{File,Line}};
 form({attribute,Anno,export,Es0}) ->
     Es1 = farity_list(Es0),
@@ -129,7 +148,7 @@ form({attribute,Anno,spec,{{M,N,A},FTs}}) ->
 form({attribute,Anno,callback,{{N,A},FTs}}) ->
     FTs1 = function_type_list(FTs),
     {attribute,Anno,callback,{{N,A},FTs1}};
-form({attribute,Anno,Attr,Val}) ->		%The general attribute.
+form({attribute,Anno,Attr,Val}) ->              %The general attribute.
     {attribute,Anno,Attr,Val};
 
 form({function,Anno,Name0,Arity0,Clauses0}) ->
@@ -212,8 +231,8 @@ patterns([]) -> [].
 %%  N.B. Only valid patterns are included here.
 
 pattern({record,Anno,?StrRec,
-	 [{record_field,_,{atom,_,module},StructMod},
-	  {record_field,_,{atom,_,fields},Fields}]}) ->
+         [{record_field,_,{atom,_,module},StructMod},
+          {record_field,_,{atom,_,fields},Fields}]}) ->
     %% io:format("pat ~p\n", [Fields]),
     StructModField = {map_field_exact,Anno,{atom,Anno,'__struct__'},StructMod},
     StructFields = to_struct_map_fields(Fields, map_field_exact),
@@ -446,13 +465,24 @@ exprs([]) -> [].
 %% -type expr(Expression) -> Expression.
 
 expr({record,Anno,?StrRec,
-      [{record_field,_,{atom,_,module},{atom,_,_Mod} = StructMod},
+      [{record_field,_,{atom,_,module},{atom,_,Mod} = StructMod},
        {record_field,_,{atom,_,fields},Fields}]}) ->
     Pairs = to_struct_pairs(Fields),		%For checking our fields.
-    %% io:format("expr ~p\n    ~p\n", [Fields,Pairs]),
     %% Check the fields for valid keys. This bombs badly.
-    _Mod:?StrFunc(Pairs),
-    {call,Anno,{remote,Anno,StructMod,{atom,Anno,?StrFunc}}, [Fields]};
+    io:format("expr ~p\n    ~p\n", [Fields,Pairs]),
+    case get(struct_data) of
+	#struct_data{def_fields = DefFields} ->
+	    case get(module_name) of
+		Mod ->				%This is us.
+		    DefStruct = maps:from_list([{'__struct__',Mod}|DefFields]),
+		    '__struct__'(DefStruct, Pairs);
+		_Other ->
+		    Mod:'__struct__'(Pairs)
+	    end;
+	undefined ->
+	    Mod:'__struct__'(Pairs)
+    end,
+    {call,Anno,{remote,Anno,StructMod,{atom,Anno,'__struct__'}}, [Fields]};
 
 expr({var,Anno,V}) -> {var,Anno,V};
 expr({integer,Anno,I}) -> {integer,Anno,I};
@@ -756,35 +786,31 @@ to_struct_map_fields({cons,_,{tuple,Fanno,[Key,Value]},Fs}, FieldType) ->
     [{FieldType,Fanno,Key,Value} | to_struct_map_fields(Fs, FieldType)];
 to_struct_map_fields({nil,_}, _FieldType) -> [].
 
-%% to_struct_pairs({cons,_,{tuple,Fanno,[Key,Value]} = Pair,Fs}) ->
-%%     [Pair | to_struct_pairs(Fs)];
-%% to_struct_pairs({nil,_}) -> [].
-
 to_struct_pairs({cons,_,{tuple,_,[{atom,_,Key},_Value]},Fs}) ->
     [{Key,none} | to_struct_pairs(Fs)];
 to_struct_pairs({nil,_}) -> [].
 
 struct_attributes() ->
-    case get(struct_fields) of
-	none ->
+    case get(struct_data) of
+	undefined ->				%No struct defined.
 	    [];
-	_StructFields ->
-	    Anno = get(struct_anno),
+	#struct_data{anno = Anno} ->
 	    [{attribute,Anno,export,[{?StrFunc,0},{?StrFunc,1}]}]
     end.
 
 struct_inits() ->
     Mod = get(module_name),
-    case get(struct_fields) of
-	none -> [];
-	StructFields ->
-	    Anno = get(struct_anno),
+    case get(struct_data) of
+	undefined ->				%No struct defined.
+	    [];
+	#struct_data{anno = Anno,
+		     map_fields = StructFields} ->
 	    DefStruct = {map,Anno,[{map_field_assoc,Anno,
 				    {atom,Anno,'__struct__'},{atom,Anno,Mod}} |
 				   StructFields]},
-	    [{function,Anno,?StrFunc,0,
+	    [{function,Anno,'__struct__',0,
 	      [{clause,Anno,[],[],[DefStruct]}]},
-	     {function,Anno,?StrFunc,1,
+	     {function,Anno,'__struct__',1,
 	      [{clause,Anno,[{var,Anno,'Assocs'}],[],
 		[{call,Anno,{remote,Anno,{atom,Anno,lists},{atom,Anno,foldl}},
 		  [{'fun', Anno,
@@ -799,6 +825,14 @@ struct_inits() ->
 			  {var,Anno,'Val'},
 			  {var,Anno,'Map'}]}]}]}},
 		   DefStruct,
-		   {var,Anno,'Assocs'}]}]}]}
-	    ]
+		   {var,Anno,'Assocs'}]}]}]}]
     end.
+
+%% Out internal __struct__ function
+
+'__struct__'(DefMap, Assocs) ->
+    lists:foldl(fun ({Key, Val}, Map) ->
+			maps:update(Key, Val, Map)
+		end,
+		DefMap,
+		Assocs).
