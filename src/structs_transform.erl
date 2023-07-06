@@ -38,21 +38,43 @@
 %% Struct data saved. In this quick hack we store it in the process
 %% dictionary
 
--record(struct_data, {mod,
+-record(struct_data, {module,
 		      anno,			%Struct anno
-		      def_struct,		%The default struct map
 		      def_fields,		%Fields from default struct
-		      map_fields		%Fields as for map
+		      map_fields,		%Fields as for default map
+		      def_struct		%The default struct map
 		     }).
 
+-define(STACKTRACE,
+        element(2, erlang:process_info(self(), current_stacktrace))).
+
 parse_transform(Forms, _Options) ->
-    Fs = forms(Forms),
-    %% Make sure we get all the attributes first and the struct
-    %% functions.
-    Attrs = collect_attributes(Fs),
-    Others = collect_others(Fs),
-    io:format("Get ~p\n", [get()]),
-    Attrs ++ struct_attributes() ++ struct_inits() ++ Others.
+    %% StackTrace = ?STACKTRACE,
+    %% io:format("st ~p\n", [?STACKTRACE]),
+    try
+	Fs = forms(Forms),
+	%% Make sure we get all the attributes first and the struct
+	%% functions.
+	Attrs = collect_attributes(Fs),
+	Others = collect_others(Fs),
+	io:format("Get ~p\n", [get()]),
+	Attrs ++ struct_attributes() ++ struct_inits() ++ Others
+    catch
+	error:Error:St ->
+	    erlang:raise(error, Error, St)
+    after
+	erase(struct_data),
+	erase(module_name)
+    end.
+
+%% parse_transform(Forms, _Options) ->
+%%     Fs = forms(Forms),
+%%     %% Make sure we get all the attributes first and the struct
+%%     %% functions.
+%%     Attrs = collect_attributes(Fs),
+%%     Others = collect_others(Fs),
+%%     io:format("Get ~p\n", [get()]),
+%%     Attrs ++ struct_attributes() ++ struct_inits() ++ Others.
 
 parse_transform_info() ->
     #{error_location => column}.
@@ -86,24 +108,35 @@ forms([]) -> [].
 %%  that the ordering is correct!
 
 %% First the various attributes.
-form({attribute,Anno,defstruct,DefFields} = DefStruct) ->
+
+form({error,Err}) ->
+    %% This catches errors in attributes which we would otherwise
+    %% ignore here.
+    erlang:error({error,Err});
+
+form({attribute,Anno,defstruct,DefFields} = StructAttr) ->
     Fun = fun ({Key,Val}) -> {map_field_assoc,Anno,
                               erl_parse:abstract(Key, Anno),
                               erl_parse:abstract(Val, Anno)} end,
     %% StructFields = lists:map(Fun, maps:to_list(StructDef)),
-    io:format("def ~p\n    ~p\n",
-              [DefFields,erl_parse:abstract(Anno,DefFields)]),
+    %% io:format("def ~p\n    ~p\n",
+    %%           [DefFields,erl_parse:abstract(Anno,DefFields)]),
     MapFields = lists:map(Fun, DefFields),
     %% Save the struct info.
-    StructData = #struct_data{anno = Anno,
+    {name,Mod} = get(module_name),
+    DefStruct = maps:from_list([{'__struct__',Mod} | DefFields]),
+    StructData = #struct_data{module = Mod,
+			      anno = Anno,
 			      def_fields = DefFields,
-			      map_fields = MapFields
+			      map_fields = MapFields,
+			      def_struct = DefStruct
 			     },
+    %% io:format("sd ~p\n", [StructData]),
     put(struct_data, StructData),		%We have a struct!
-    DefStruct;                                  %Save it in the module
+    StructAttr;                                 %Save it in the module
 
 form({attribute,Anno,module,Mod}) ->
-    put(module_name, Mod),			%Save the current module name
+    put(module_name, {name,Mod}),		%Save the current module name
     {attribute,Anno,module,Mod};
 form({attribute,Anno,file,{File,Line}}) ->      %This is valid anywhere.
     {attribute,Anno,file,{File,Line}};
@@ -231,10 +264,15 @@ patterns([]) -> [].
 %%  N.B. Only valid patterns are included here.
 
 pattern({record,Anno,?StrRec,
-         [{record_field,_,{atom,_,module},StructMod},
+         [{record_field,_,{atom,_,module},{atom,_,StrMod}},
           {record_field,_,{atom,_,fields},Fields}]}) ->
     %% io:format("pat ~p\n", [Fields]),
-    StructModField = {map_field_exact,Anno,{atom,Anno,'__struct__'},StructMod},
+    %% Check the fields for valid keys. This bombs badly.
+    check_struct_fields(StrMod, Anno, Fields),
+    %% io:format("check ~p\n", [Check]),
+
+    StructModField = {map_field_exact,Anno,
+		      {atom,Anno,'__struct__'},{atom,Anno,StrMod}},
     StructFields = to_struct_map_fields(Fields, map_field_exact),
     {map,Anno,[StructModField | StructFields]};
 
@@ -465,24 +503,18 @@ exprs([]) -> [].
 %% -type expr(Expression) -> Expression.
 
 expr({record,Anno,?StrRec,
-      [{record_field,_,{atom,_,module},{atom,_,Mod} = StructMod},
+      [{record_field,_,{atom,_,module},{atom,_,StrMod}},
        {record_field,_,{atom,_,fields},Fields}]}) ->
-    Pairs = to_struct_pairs(Fields),		%For checking our fields.
+
+    %% Pairs = to_struct_pairs(Fields),		%For checking our fields.
+    %% io:format("expr ~p\n    ~p\n", [Fields,Pairs]),
+    %% io:format("get ~p\n", [get()]),
+
     %% Check the fields for valid keys. This bombs badly.
-    io:format("expr ~p\n    ~p\n", [Fields,Pairs]),
-    case get(struct_data) of
-	#struct_data{def_fields = DefFields} ->
-	    case get(module_name) of
-		Mod ->				%This is us.
-		    DefStruct = maps:from_list([{'__struct__',Mod}|DefFields]),
-		    '__struct__'(DefStruct, Pairs);
-		_Other ->
-		    Mod:'__struct__'(Pairs)
-	    end;
-	undefined ->
-	    Mod:'__struct__'(Pairs)
-    end,
-    {call,Anno,{remote,Anno,StructMod,{atom,Anno,'__struct__'}}, [Fields]};
+    check_struct_fields(StrMod, Anno, Fields),
+    %% io:format("check ~p\n", [Check]),
+    {call,Anno,{remote,Anno,{atom,Anno,StrMod},{atom,Anno,'__struct__'}},
+     [Fields]};
 
 expr({var,Anno,V}) -> {var,Anno,V};
 expr({integer,Anno,I}) -> {integer,Anno,I};
@@ -782,6 +814,30 @@ type_list([]) -> [].
 
 %% Struct stuff.
 
+check_struct_fields(StrMod, Anno, Fields) ->
+    Pairs = to_struct_pairs(Fields),
+    case get(struct_data) of
+	#struct_data{module = Mod,def_struct = DefStr} ->
+	    if Mod =:= StrMod ->
+		    %% Our own local '__struct__'/1.
+		    '__struct__'(DefStr, Pairs);
+	       true ->
+		    check_struct(StrMod, Anno, Pairs)
+	    end;
+	undefined ->
+	    check_struct(StrMod, Anno, Pairs)
+    end.
+
+check_struct(StrMod, Anno, Assocs) ->
+    try
+	StrMod:'__struct__'(Assocs)
+    catch
+	error:_Error ->
+	    erlang:error({undefined_struct,Anno,StrMod})
+    end.
+
+%% lists:all(fun ({Key,_}) -> maps:is_key(Key, DefStruct) end, Assocs).
+
 to_struct_map_fields({cons,_,{tuple,Fanno,[Key,Value]},Fs}, FieldType) ->
     [{FieldType,Fanno,Key,Value} | to_struct_map_fields(Fs, FieldType)];
 to_struct_map_fields({nil,_}, _FieldType) -> [].
@@ -799,7 +855,7 @@ struct_attributes() ->
     end.
 
 struct_inits() ->
-    Mod = get(module_name),
+    {name,Mod} = get(module_name),
     case get(struct_data) of
 	undefined ->				%No struct defined.
 	    [];
@@ -828,7 +884,7 @@ struct_inits() ->
 		   {var,Anno,'Assocs'}]}]}]}]
     end.
 
-%% Out internal __struct__ function
+%% Our internal __struct__ function
 
 '__struct__'(DefMap, Assocs) ->
     lists:foldl(fun ({Key, Val}, Map) ->
