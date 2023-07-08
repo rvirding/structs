@@ -25,7 +25,8 @@
 %% N.B. if this module is to be used as a basis for transforms then
 %% all the error cases must be handled otherwise this module just crashes!
 
--export([parse_transform/2, parse_transform_info/0]).
+-export([parse_transform/2, parse_transform_info/0,
+	 format_error/1]).
 
 %% Pseudo record used by struct macros. It is never really defined but
 %% the struct include file "know" how we use it.
@@ -48,33 +49,37 @@
 -define(STACKTRACE,
         element(2, erlang:process_info(self(), current_stacktrace))).
 
+format_error(Error) ->
+    io_lib:format("~tw", [Error]).
+
 parse_transform(Forms, _Options) ->
-    %% StackTrace = ?STACKTRACE,
-    %% io:format("st ~p\n", [?STACKTRACE]),
     try
 	Fs = forms(Forms),
 	%% Make sure we get all the attributes first and the struct
 	%% functions.
 	Attrs = collect_attributes(Fs),
 	Others = collect_others(Fs),
-	io:format("Get ~p\n", [get()]),
 	Attrs ++ struct_attributes() ++ struct_inits() ++ Others
     catch
-	error:Error:St ->
-	    erlang:raise(error, Error, St)
+	throw:{struct_error,Anno,Error}:_St ->
+	    FileName = get_file_name(),
+	    {error,[{FileName, [{Anno,?MODULE,Error}]}], []}
+	%% error:Error:St ->
+	%%     FileName = get_file_name(),
+	%%     {error,[{FileName, [{,?MODULE,Error}]}], []}
     after
 	erase(struct_data),
 	erase(module_name)
     end.
 
-%% parse_transform(Forms, _Options) ->
-%%     Fs = forms(Forms),
-%%     %% Make sure we get all the attributes first and the struct
-%%     %% functions.
-%%     Attrs = collect_attributes(Fs),
-%%     Others = collect_others(Fs),
-%%     io:format("Get ~p\n", [get()]),
-%%     Attrs ++ struct_attributes() ++ struct_inits() ++ Others.
+get_file_name() ->
+    %% Just guessing really!
+    case get(module_name) of
+	{name,Name} ->
+	    atom_to_list(Name) ++ ".erl";
+	undefined ->
+	    "undefined"
+    end.
 
 parse_transform_info() ->
     #{error_location => column}.
@@ -109,18 +114,10 @@ forms([]) -> [].
 
 %% First the various attributes.
 
-form({error,Err}) ->
-    %% This catches errors in attributes which we would otherwise
-    %% ignore here.
-    erlang:error({error,Err});
-
 form({attribute,Anno,defstruct,DefFields} = StructAttr) ->
     Fun = fun ({Key,Val}) -> {map_field_assoc,Anno,
                               erl_parse:abstract(Key, Anno),
                               erl_parse:abstract(Val, Anno)} end,
-    %% StructFields = lists:map(Fun, maps:to_list(StructDef)),
-    %% io:format("def ~p\n    ~p\n",
-    %%           [DefFields,erl_parse:abstract(Anno,DefFields)]),
     MapFields = lists:map(Fun, DefFields),
     %% Save the struct info.
     {name,Mod} = get(module_name),
@@ -266,10 +263,8 @@ patterns([]) -> [].
 pattern({record,Anno,?StrRec,
          [{record_field,_,{atom,_,module},{atom,_,StrMod}},
           {record_field,_,{atom,_,fields},Fields}]}) ->
-    %% io:format("pat ~p\n", [Fields]),
     %% Check the fields for valid keys. This bombs badly.
     check_struct_fields(StrMod, Anno, Fields),
-    %% io:format("check ~p\n", [Check]),
 
     StructModField = {map_field_exact,Anno,
 		      {atom,Anno,'__struct__'},{atom,Anno,StrMod}},
@@ -506,13 +501,8 @@ expr({record,Anno,?StrRec,
       [{record_field,_,{atom,_,module},{atom,_,StrMod}},
        {record_field,_,{atom,_,fields},Fields}]}) ->
 
-    %% Pairs = to_struct_pairs(Fields),		%For checking our fields.
-    %% io:format("expr ~p\n    ~p\n", [Fields,Pairs]),
-    %% io:format("get ~p\n", [get()]),
-
     %% Check the fields for valid keys. This bombs badly.
     check_struct_fields(StrMod, Anno, Fields),
-    %% io:format("check ~p\n", [Check]),
     {call,Anno,{remote,Anno,{atom,Anno,StrMod},{atom,Anno,'__struct__'}},
      [Fields]};
 
@@ -820,7 +810,12 @@ check_struct_fields(StrMod, Anno, Fields) ->
 	#struct_data{module = Mod,def_struct = DefStr} ->
 	    if Mod =:= StrMod ->
 		    %% Our own local '__struct__'/1.
-		    '__struct__'(DefStr, Pairs);
+		    try
+			'__struct__'(DefStr, Pairs)
+		    catch
+			error:Error ->
+			    erlang:throw({struct_error,Anno,Error})
+		    end;
 	       true ->
 		    check_struct(StrMod, Anno, Pairs)
 	    end;
@@ -833,8 +828,17 @@ check_struct(StrMod, Anno, Assocs) ->
 	StrMod:'__struct__'(Assocs)
     catch
 	error:_Error ->
-	    erlang:error({undefined_struct,Anno,StrMod})
+	    erlang:throw({struct_error,Anno,{undefined_struct,StrMod}})
     end.
+
+%% Our internal __struct__ function
+
+'__struct__'(DefMap, Assocs) ->
+    lists:foldl(fun ({Key, Val}, Map) ->
+			maps:update(Key, Val, Map)
+		end,
+		DefMap,
+		Assocs).
 
 %% lists:all(fun ({Key,_}) -> maps:is_key(Key, DefStruct) end, Assocs).
 
@@ -883,12 +887,3 @@ struct_inits() ->
 		   DefStruct,
 		   {var,Anno,'Assocs'}]}]}]}]
     end.
-
-%% Our internal __struct__ function
-
-'__struct__'(DefMap, Assocs) ->
-    lists:foldl(fun ({Key, Val}, Map) ->
-			maps:update(Key, Val, Map)
-		end,
-		DefMap,
-		Assocs).
